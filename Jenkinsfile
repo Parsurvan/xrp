@@ -120,10 +120,6 @@ try {
             ['gcc.Release'    ,'-Dassert=ON'     ,'MANUAL_TESTS=true'     ],
             ['gcc.Debug'      ,'-Dcoverage=ON'   ,'TARGET=coverage_report', 'SKIP_TESTS=true'],
             ['docs'           ,''                ,'TARGET=docs'           ],
-            ['msvc.Debug'                                                 ],
-            ['msvc.Debug'     ,''                ,'NINJA_BUILD=true'      ],
-            ['msvc.Debug'     ,'-Dunity=OFF'                              ],
-            ['msvc.Release'                                               ],
             ['clang.Debug'                                                ],
             ['clang.Debug'    ,'-Dunity=OFF'                              ],
             ['gcc.Debug'                                                  ],
@@ -168,8 +164,7 @@ try {
             def cxx =
                 (compiler == 'clang') ? '/opt/llvm-5.0.1/bin/clang++' : 'g++'
             def ucc = isNoUnity(cmake_extra) ? 'true' : 'false'
-            def node_type =
-                (compiler == 'msvc') ? 'rippled-win' : 'rippled-dev'
+            def node_type = 'rippled-dev'
             // the default disposition for parallel test..disabled
             // for coverage, enabled otherwise. Can still be overridden
             // by explicitly setting with extra env settings above.
@@ -200,28 +195,19 @@ try {
                     echo "USE_CC: ${ucc}"
                     env_vars.addAll([
                         "NIH_CACHE_ROOT=${cdir}/.nih_c"])
-                    if (compiler == 'msvc') {
-                        env_vars.addAll([
-                            'BOOST_ROOT=c:\\lib\\boost_1_70',
-                            'PROJECT_NAME=rippled',
-                            'MSBUILDDISABLENODEREUSE=1',  // this ENV setting is probably redundant since we also pass /nr:false to msbuild
-                            'OPENSSL_ROOT=c:\\OpenSSL-Win64'])
-                    }
-                    else {
-                        env_vars.addAll([
-                            'NINJA_BUILD=false',
-                            "CCACHE_BASEDIR=${cdir}",
-                            'PLANTUML_JAR=/opt/plantuml/plantuml.jar',
-                            'APP_ARGS=--unittest-ipv6',
-                            'CCACHE_NOHASHDIR=true',
-                            "CC=${cc}",
-                            "CXX=${cxx}",
-                            'LCOV_ROOT=""',
-                            'PATH+CMAKE_BIN=/opt/local/cmake',
-                            'GDB_ROOT=/opt/local/gdb',
-                            'BOOST_ROOT=/opt/local/boost_1_70_0',
-                            "USE_CCACHE=${ucc}"])
-                    }
+                    env_vars.addAll([
+                        'NINJA_BUILD=false',
+                        "CCACHE_BASEDIR=${cdir}",
+                        'PLANTUML_JAR=/opt/plantuml/plantuml.jar',
+                        'APP_ARGS=--unittest-ipv6',
+                        'CCACHE_NOHASHDIR=true',
+                        "CC=${cc}",
+                        "CXX=${cxx}",
+                        'LCOV_ROOT=""',
+                        'PATH+CMAKE_BIN=/opt/local/cmake',
+                        'GDB_ROOT=/opt/local/gdb',
+                        'BOOST_ROOT=/opt/local/boost_1_70_0',
+                        "USE_CCACHE=${ucc}"])
 
                     if (extra_env.size() > 0) {
                         env_vars.addAll(extra_env)
@@ -255,29 +241,10 @@ try {
                               time: max_minutes * 2,
                               units: 'MINUTES')
                             {
-                                if (compiler == 'msvc') {
-                                    powershell "Remove-Item -Path \"${bldlabel}.txt\" -Force -ErrorAction Ignore"
-                                    // we capture stdout to variable because I could
-                                    // not figure out how to make powershell redirect internally
-                                    output = powershell (
-                                            returnStdout: true,
-                                            script: windowsBuildCmd())
-                                    // if the powershell command fails (has nonzero exit)
-                                    // then the command above throws, we don't get our output,
-                                    // and we never create this output file.
-                                    //  SEE https://issues.jenkins-ci.org/browse/JENKINS-44930
-                                    // Alternatively, figure out how to reliably redirect
-                                    // all output above to a file (Start/Stop transcript does not work)
-                                    writeFile(
-                                        file: "${bldlabel}.txt",
-                                        text: output)
-                                }
-                                else {
-                                    sh "rm -fv ${bldlabel}.txt"
-                                    // execute the bld command in a redirecting shell
-                                    // to capture output
-                                    sh redhatBuildCmd(bldlabel)
-                                }
+                                sh "rm -fv ${bldlabel}.txt"
+                                // execute the bld command in a redirecting shell
+                                // to capture output
+                                sh redhatBuildCmd(bldlabel)
                             }
                         }
                         catch(e) {
@@ -327,6 +294,28 @@ try {
         // this actually executes all the builds we just defined
         // above, in parallel as slaves are available
         parallel builds
+
+        stage('Publish to S3') {
+            node('rippled-dev') {
+                withCredentials([
+                    string(credentialsId: 'contabo-s3-access-key', variable: 'S3_ACCESS'),
+                    string(credentialsId: 'contabo-s3-secret-key', variable: 'S3_SECRET')
+                ]) {
+                    step([$class: 'PegatonCodeDeployPublisher',
+                        ossBucket:    'pegaton',
+                        ossObject:    'xrp-ci',
+                        region:       'eu2',
+                        includes:     '**/*.tar.gz,**/*.deb,**/*.rpm',
+                        excludes:     '',
+                        subdirectory: '',
+                        accessKey:    env.S3_ACCESS,
+                        secretKey:    env.S3_SECRET,
+                        doDeploy:     false,
+                        instanceId:   ''
+                    ])
+                }
+            }
+        }
     }
 }
 finally {
@@ -476,8 +465,6 @@ def getCommitID () {
 def getResults(text, label) {
     // example:
     ///   194.5s, 154 suites, 948 cases, 360485 tests total, 0 failures
-    // or build log format:
-    //    [msvc.release] 71.3s, 162 suites, 995 cases, 318901 tests total, 1 failure
     def matcher =
         text == '' ?
         manager.getLogMatcher(/\[${label}\].+?(\d+) case[s]?, (\d+) test[s]? total, (\d+) (failure(s?))/) :
@@ -587,67 +574,6 @@ ccache -s
 source /opt/rh/devtoolset-7/enable
 /usr/bin/time -p ./bin/ci/ubuntu/build-and-test.sh 2>&1
 ccache -s
-'''
-}
-
-// the powershell command used for building
-def windowsBuildCmd() {
-'''
-# Enable streams 3-6
-$WarningPreference = 'Continue'
-$VerbosePreference = 'Continue'
-$DebugPreference = 'Continue'
-$InformationPreference = 'Continue'
-
-Invoke-BatchFile "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\2017\\Community\\VC\\Auxiliary\\Build\\vcvarsall.bat" x86_amd64
-Get-ChildItem env:* | Sort-Object name
-cl
-cmake --version
-New-Item -ItemType Directory -Force -Path "build/$env:BUILD_DIR" -ErrorAction Stop
-$sw = [Diagnostics.Stopwatch]::StartNew()
-try {
-    Push-Location "build/$env:BUILD_DIR"
-    if ($env:NINJA_BUILD -eq "true") {
-        Invoke-Expression "& cmake -G`"Ninja`" -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE -DCMAKE_VERBOSE_MAKEFILE=ON $env:CMAKE_EXTRA_ARGS ../.."
-    }
-    else {
-        Invoke-Expression "& cmake -G`"Visual Studio 15 2017 Win64`" -DCMAKE_VERBOSE_MAKEFILE=ON $env:CMAKE_EXTRA_ARGS ../.."
-    }
-    if ($LastExitCode -ne 0) { throw "CMake failed" }
-
-    ## as of 01/2018, DO NOT USE cmake to run the actual build step. for some
-    ## reason, cmake spawning the build under jenkins causes MSBUILD/ninja to
-    ## get stuck at the end of the build. Perhaps cmake is spawning
-    ## incorrectly or failing to pass certain params
-
-    if ($env:NINJA_BUILD -eq "true") {
-        ninja -j $env:NUMBER_OF_PROCESSORS -v
-    }
-    else {
-        msbuild /fl /m /nr:false /p:Configuration="$env:BUILD_TYPE" /p:Platform=x64 /p:GenerateFullPaths=True /v:normal /nologo /clp:"ShowCommandLine;DisableConsoleColor" "$env:PROJECT_NAME.vcxproj"
-    }
-    if ($LastExitCode -ne 0) { throw "CMake build failed" }
-
-    $exe = "./$env:BUILD_TYPE/$env:PROJECT_NAME"
-    if ($env:NINJA_BUILD -eq "true") {
-        $exe = "./$env:PROJECT_NAME"
-    }
-    "Exe is at $exe"
-    $params = '--unittest', '--quiet', '--unittest-log'
-    if ($env:PARALLEL_TESTS -eq "true") {
-        $params = $params += "--unittest-jobs=$env:NUMBER_OF_PROCESSORS"
-    }
-    & $exe $params
-    if ($LastExitCode -ne 0) { throw "Unit tests failed" }
-}
-catch {
-    throw
-}
-finally {
-    $sw.Stop()
-    $sw.Elapsed
-    Pop-Location
-}
 '''
 }
 
